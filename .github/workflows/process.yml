@@ -1,0 +1,30 @@
+name: Process Telegram Media
+on:
+  repository_dispatch:
+    types: [process_media]
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+      - name: Install dependencies
+        run: |
+          pip install telethon hachoir aiohttp boto3
+      - name: Run processor
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          STRING_SESSION: ${{ secrets.STRING_SESSION }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+          PUBLIC_URL_PREFIX: ${{ secrets.PUBLIC_URL_PREFIX }}
+          TARGET_CHAT_ID: ${{ github.event.client_payload.chat_id }}
+          MEDIA_LINK: ${{ github.event.client_payload.media_link }}
+        run: python processor.py
