@@ -1,6 +1,7 @@
 import os
 import asyncio
 import aiohttp
+import requests
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
@@ -27,21 +28,31 @@ async def upload_to_supabase(file_path, file_name):
         with open(file_path, 'rb') as f:
             async with session.post(url, headers=headers, data=f) as resp:
                 if resp.status in [200, 201]:
-                    # Generate Public URL
                     return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{file_name}"
                 else:
                     text = await resp.text()
                     raise Exception(f"Supabase Upload Failed: {text}")
 
+def send_telegram_with_delete_button(chat_id, text, file_name):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown",
+        "reply_markup": {
+            "inline_keyboard": [[
+                {"text": "🗑️ Delete from Cloud", "callback_data": f"delete:{file_name}"}
+            ]]
+        }
+    }
+    requests.post(url, json=payload)
+
 async def main():
-    # User Client for Downloading Restricted Content
     client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
-    # Bot Client for Sending Messages
     bot = TelegramClient('bot', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
     await client.connect()
     
     try:
-        # 1. Parse Link and Download
         parts = MEDIA_LINK.split('/')
         msg_id = int(parts[-1])
         chat_id = parts[-2]
@@ -56,16 +67,18 @@ async def main():
             return
             
         file_path = await client.download_media(msg)
+        file_name = os.path.basename(file_path)
+        
         await bot.send_message(TARGET_CHAT_ID, "✅ Downloaded. Uploading to Supabase and Telegram...")
         
-        # 2. Upload to Telegram (as file)
-        await bot.send_file(TARGET_CHAT_ID, file_path, caption="Here is your media!")
+        # 1. Upload to Telegram (as file)
+        await bot.send_file(TARGET_CHAT_ID, file_path, caption=f"File: {file_name}")
         
-        # 3. Upload to Supabase for Direct Link
+        # 2. Upload to Supabase for Direct Link
         if SUPABASE_URL and SUPABASE_KEY:
-            file_name = os.path.basename(file_path)
             public_url = await upload_to_supabase(file_path, file_name)
-            await bot.send_message(TARGET_CHAT_ID, f"🔗 Direct Download Link:\n`{public_url}`")
+            message_text = f"🔗 *Direct Download Link:*\n`{public_url}`\n\n_You can delete this file from cloud storage after downloading._"
+            send_telegram_with_delete_button(TARGET_CHAT_ID, message_text, file_name)
             
     except Exception as e:
         await bot.send_message(TARGET_CHAT_ID, f"❌ Error: {str(e)}")
