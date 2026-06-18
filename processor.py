@@ -17,6 +17,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 TARGET_CHAT_ID = int(os.environ.get("TARGET_CHAT_ID", 0))
 MEDIA_LINK = os.environ.get("MEDIA_LINK", "")
 QUALITY = os.environ.get("QUALITY", "720")
+WF_NAME = os.environ.get("WF_NAME", "Unknown WF")
 
 # Backblaze B2 Settings
 B2_KEY_ID = os.environ.get("B2_KEY_ID", "")
@@ -42,25 +43,17 @@ def send_tg_msg(text):
 
 async def download_telegram_media(client, link, file_path):
     try:
-        # Match t.me links
         match = re.search(r't\.me/(?:c/)?([^/]+)/(\d+)', link)
         if not match: return False, "Invalid Telegram link format."
-        
         chat_identifier = match.group(1)
         msg_id = int(match.group(2))
-        
-        # Handle private vs public chat identifiers
         if chat_identifier.isdigit():
             chat_id = int(f"-100{chat_identifier}")
         else:
             chat_id = chat_identifier
-            
         entity = await client.get_entity(chat_id)
         message = await client.get_messages(entity, ids=msg_id)
-        
-        if not message or not message.media: 
-            return False, "No media found in the message."
-        
+        if not message or not message.media: return False, "No media found."
         await client.download_media(message, file_path)
         return True, None
     except Exception as e:
@@ -70,53 +63,42 @@ async def main():
     file_path = f"video_{int(time.time())}.mp4"
     is_tg_link = "t.me/" in MEDIA_LINK
     
-    send_tg_msg("⏳ *Downloading...* Please wait.")
+    send_tg_msg(f"⏳ *[{WF_NAME}] Downloading...* Please wait.")
 
     if is_tg_link:
         if not STRING_SESSION:
-            send_tg_msg("❌ STRING_SESSION missing. Cannot download from Telegram.")
+            send_tg_msg(f"❌ *[{WF_NAME}]* STRING_SESSION missing.")
             return
         client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
         await client.connect()
         success, err = await download_telegram_media(client, MEDIA_LINK, file_path)
         await client.disconnect()
         if not success:
-            send_tg_msg(f"❌ TG Download Error: {err}")
+            send_tg_msg(f"❌ *[{WF_NAME}]* TG Download Error: {err}")
             return
     else:
-        # For non-Telegram links (YouTube, etc.)
         format_str = f"bestvideo[height<={QUALITY}]+bestaudio/best[height<={QUALITY}]/best"
         cmd = ['yt-dlp', '-f', format_str, '--merge-output-format', 'mp4', '-o', file_path, MEDIA_LINK]
         process = subprocess.run(cmd)
         if process.returncode != 0:
-            send_tg_msg("❌ yt-dlp Download Failed.")
+            send_tg_msg(f"❌ *[{WF_NAME}]* yt-dlp Download Failed.")
             return
 
     if os.path.exists(file_path):
-        send_tg_msg("🚀 *Uploading to Backblaze B2...*")
+        send_tg_msg(f"🚀 *[{WF_NAME}] Uploading to B2...*")
         file_name = os.path.basename(file_path)
-        
         try:
-            # Upload to B2
             s3.upload_file(file_path, B2_BUCKET_NAME, file_name)
-            
-            # Generate Presigned URL (Valid for 24 hours)
             download_url = s3.generate_presigned_url(
-                'get_object',
-                Params={'Bucket': B2_BUCKET_NAME, 'Key': file_name},
-                ExpiresIn=86400
+                'get_object', Params={'Bucket': B2_BUCKET_NAME, 'Key': file_name}, ExpiresIn=86400
             )
-            
-            msg = f"✅ *Download Complete!*\n\n📄 File: `{file_name}`\n🔗 [Direct Download Link]({download_url})\n\n_Note: This link is valid for 24 hours._"
+            msg = f"✅ *[{WF_NAME}] Download Complete!*\n\n📄 File: `{file_name}`\n🔗 [Direct Download Link]({download_url})\n\n_Note: This link is valid for 24 hours._"
             send_tg_msg(msg)
-            
-            # Cleanup local file
-            if os.path.exists(file_path):
-                os.remove(file_path)
+            os.remove(file_path)
         except Exception as e:
-            send_tg_msg(f"❌ B2 Upload Error: {str(e)}")
+            send_tg_msg(f"❌ *[{WF_NAME}]* B2 Upload Error: {str(e)}")
     else:
-        send_tg_msg("❌ Error: File not found after download.")
+        send_tg_msg(f"❌ *[{WF_NAME}]* Error: File not found.")
 
 if __name__ == "__main__":
     asyncio.run(main())
