@@ -4,11 +4,10 @@ import re
 import time
 import subprocess
 import requests
-import boto3
-from botocore.client import Config
-from telethon import TelegramClient, events
+import base64
+import hashlib
+from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.types import MessageMediaWebPage
 
 # Environment Variables
 API_ID = int(os.environ.get("API_ID", 0))
@@ -21,19 +20,79 @@ QUALITY = os.environ.get("QUALITY", "720")
 WF_NAME = os.environ.get("WF_NAME", "Unknown WF")
 
 # Backblaze B2 Settings
-B2_KEY_ID = os.environ.get("B2_KEY_ID", "")
-B2_APPLICATION_KEY = os.environ.get("B2_APPLICATION_KEY", "")
-B2_BUCKET_NAME = os.environ.get("B2_BUCKET_NAME", "")
-B2_ENDPOINT = os.environ.get("B2_ENDPOINT", "s3.us-east-005.backblazeb2.com")
+B2_KEY_ID = os.environ.get("B2_KEY_ID", "").strip()
+B2_APPLICATION_KEY = os.environ.get("B2_APPLICATION_KEY", "").strip()
+B2_BUCKET_NAME = os.environ.get("B2_BUCKET_NAME", "").strip()
 
-# S3 Client for Backblaze B2
-s3 = boto3.client(
-    's3',
-    endpoint_url=f'https://{B2_ENDPOINT}',
-    aws_access_key_id=B2_KEY_ID,
-    aws_secret_access_key=B2_APPLICATION_KEY,
-    config=Config(signature_version='s3v4')
-)
+class B2NativeClient:
+    def __init__(self, key_id, app_key):
+        self.key_id = key_id
+        self.app_key = app_key
+        self.auth_token = None
+        self.api_url = None
+        self.download_url = None
+        self.account_id = None
+
+    def authorize(self):
+        auth_string = f"{self.key_id}:{self.app_key}"
+        encoded_auth = base64.b64encode(auth_string.encode()).decode()
+        headers = {"Authorization": f"Basic {encoded_auth}"}
+        resp = requests.get("https://api.backblazeb2.com/b2api/v2/b2_authorize_account", headers=headers)
+        data = resp.json()
+        if resp.status_code != 200:
+            raise Exception(f"B2 Auth Failed: {data.get('message', 'Unknown error')}")
+        self.auth_token = data['authorizationToken']
+        self.api_url = data['apiUrl']
+        self.download_url = data['downloadUrl']
+        self.account_id = data['accountId']
+        return data
+
+    def get_upload_url(self, bucket_name):
+        # First get bucket ID
+        headers = {"Authorization": self.auth_token}
+        resp = requests.post(f"{self.api_url}/b2api/v2/b2_list_buckets", headers=headers, json={"accountId": self.account_id})
+        buckets = resp.json().get('buckets', [])
+        bucket_id = next((b['bucketId'] for b in buckets if b['bucketName'] == bucket_name), None)
+        if not bucket_id:
+            raise Exception(f"Bucket '{bucket_name}' not found.")
+        
+        resp = requests.post(f"{self.api_url}/b2api/v2/b2_get_upload_url", headers=headers, json={"bucketId": bucket_id})
+        return resp.json()
+
+    def upload_file(self, file_path, bucket_name):
+        self.authorize()
+        upload_data = self.get_upload_url(bucket_name)
+        upload_url = upload_data['uploadUrl']
+        upload_auth_token = upload_data['authorizationToken']
+        
+        file_name = os.path.basename(file_path)
+        with open(file_path, 'rb') as f:
+            file_data = f.read()
+            sha1_hash = hashlib.sha1(file_data).hexdigest()
+            
+            headers = {
+                "Authorization": upload_auth_token,
+                "X-Bz-File-Name": file_name,
+                "Content-Type": "video/mp4",
+                "X-Bz-Content-Sha1": sha1_hash
+            }
+            resp = requests.post(upload_url, headers=headers, data=file_data)
+            return resp.json()
+
+    def get_download_link(self, bucket_name, file_name):
+        # For private buckets, we need a download authorization token
+        headers = {"Authorization": self.auth_token}
+        # Get bucket ID first
+        resp = requests.post(f"{self.api_url}/b2api/v2/b2_list_buckets", headers=headers, json={"accountId": self.account_id})
+        bucket_id = next((b['bucketId'] for b in resp.json()['buckets'] if b['bucketName'] == bucket_name), None)
+        
+        resp = requests.post(f"{self.api_url}/b2api/v2/b2_get_download_authorization", headers=headers, json={
+            "bucketId": bucket_id,
+            "fileNamePrefix": file_name,
+            "validDurationInSeconds": 86400
+        })
+        token = resp.json()['authorizationToken']
+        return f"{self.download_url}/file/{bucket_name}/{file_name}?Authorization={token}"
 
 class ProgressReporter:
     def __init__(self, wf_name, bot_token, chat_id):
@@ -52,57 +111,16 @@ class ProgressReporter:
 
     def update_progress(self, current, total, action="Downloading"):
         now = time.time()
-        if now - self.last_update_time < 5:  # Update every 5 seconds to avoid TG rate limits
+        if now - self.last_update_time < 5:
             return
-        
         self.last_update_time = now
         percent = (current / total) * 100
-        text = f"⏳ *[{self.wf_name}] {action}...*\n\nProgress: `{percent:.2f}%`\nDone: `{current/(1024*1024):.2f} MB` / `{total/(1024*1024):.2f} MB`"
-        
+        text = f"⏳ *[{self.wf_name}] {action}...*\n\nProgress: `{percent:.2f}%`"
         if self.message_id:
             url = f"https://api.telegram.org/bot{self.bot_token}/editMessageText"
-            requests.post(url, json={
-                "chat_id": self.chat_id,
-                "message_id": self.message_id,
-                "text": text,
-                "parse_mode": "Markdown"
-            })
+            requests.post(url, json={"chat_id": self.chat_id, "message_id": self.message_id, "text": text, "parse_mode": "Markdown"})
         else:
             self.send_msg(text)
-
-async def download_telegram_media(client, link, file_path, reporter):
-    try:
-        # Regex for both public and private links
-        # t.me/channel/123 or t.me/c/12345678/123
-        match = re.search(r't\.me/(?:c/)?([^/]+)/(\d+)', link)
-        if not match: return False, "Invalid Telegram link format."
-        
-        chat_identifier = match.group(1)
-        msg_id = int(match.group(2))
-        
-        if chat_identifier.isdigit():
-            # Private channel IDs need -100 prefix
-            chat_id = int(f"-100{chat_identifier}")
-        else:
-            chat_id = chat_identifier
-            
-        entity = await client.get_entity(chat_id)
-        messages = await client.get_messages(entity, ids=msg_id)
-        
-        if not messages or not messages.media:
-            return False, "No media found in the message."
-        
-        message = messages # get_messages with ids returns a single object if one id
-        
-        # Start download with progress callback
-        await client.download_media(
-            message, 
-            file_path,
-            progress_callback=lambda c, t: reporter.update_progress(c, t, "Downloading")
-        )
-        return True, None
-    except Exception as e:
-        return False, str(e)
 
 async def main():
     reporter = ProgressReporter(WF_NAME, BOT_TOKEN, TARGET_CHAT_ID)
@@ -110,54 +128,29 @@ async def main():
     is_tg_link = "t.me/" in MEDIA_LINK
     
     if is_tg_link:
-        if not STRING_SESSION:
-            reporter.send_msg(f"❌ *[{WF_NAME}]* STRING_SESSION missing.")
-            return
-        
         client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
         await client.connect()
-        
-        if not await client.is_user_authorized():
-            reporter.send_msg(f"❌ *[{WF_NAME}]* Session is invalid or expired.")
-            return
-            
-        success, err = await download_telegram_media(client, MEDIA_LINK, file_path, reporter)
+        match = re.search(r't\.me/(?:c/)?([^/]+)/(\d+)', MEDIA_LINK)
+        chat_identifier, msg_id = match.group(1), int(match.group(2))
+        chat_id = int(f"-100{chat_identifier}") if chat_identifier.isdigit() else chat_identifier
+        entity = await client.get_entity(chat_id)
+        msg = await client.get_messages(entity, ids=msg_id)
+        await client.download_media(msg, file_path, progress_callback=lambda c, t: reporter.update_progress(c, t))
         await client.disconnect()
-        
-        if not success:
-            reporter.send_msg(f"❌ *[{WF_NAME}]* TG Download Error: {err}")
-            return
     else:
-        reporter.send_msg(f"⏳ *[{WF_NAME}] Starting yt-dlp...*")
-        format_str = f"bestvideo[height<={QUALITY}]+bestaudio/best[height<={QUALITY}]/best"
-        cmd = ['yt-dlp', '-f', format_str, '--merge-output-format', 'mp4', '-o', file_path, MEDIA_LINK]
-        process = subprocess.run(cmd)
-        if process.returncode != 0:
-            reporter.send_msg(f"❌ *[{WF_NAME}]* yt-dlp Download Failed.")
-            return
+        reporter.send_msg(f"⏳ *[{WF_NAME}] Downloading with yt-dlp...*")
+        subprocess.run(['yt-dlp', '-f', 'best', '-o', file_path, MEDIA_LINK])
 
     if os.path.exists(file_path):
         file_size = os.path.getsize(file_path)
-        reporter.send_msg(f"🚀 *[{WF_NAME}] Uploading to B2...* ({file_size/(1024*1024):.2f} MB)")
-        file_name = os.path.basename(file_path)
-        
+        reporter.send_msg(f"🚀 *[{WF_NAME}] Uploading to B2 (Native API)...*")
         try:
-            # Upload with boto3
-            s3.upload_file(file_path, B2_BUCKET_NAME, file_name)
+            b2 = B2NativeClient(B2_KEY_ID, B2_APPLICATION_KEY)
+            b2.upload_file(file_path, B2_BUCKET_NAME)
+            file_name = os.path.basename(file_path)
+            download_url = b2.get_download_link(B2_BUCKET_NAME, file_name)
             
-            download_url = s3.generate_presigned_url(
-                'get_object', 
-                Params={'Bucket': B2_BUCKET_NAME, 'Key': file_name}, 
-                ExpiresIn=86400
-            )
-            
-            final_msg = (
-                f"✅ *[{WF_NAME}] Download Complete!*\n\n"
-                f"📄 File: `{file_name}`\n"
-                f"⚖️ Size: `{file_size/(1024*1024):.2f} MB`\n"
-                f"🔗 [Direct Download Link]({download_url})\n\n"
-                f"_Note: Link valid for 24 hours._"
-            )
+            final_msg = f"✅ *[{WF_NAME}] Download Complete!*\n\n📄 File: `{file_name}`\n⚖️ Size: `{file_size/(1024*1024):.2f} MB`\n🔗 [Direct Download Link]({download_url})\n\n_Note: Link valid for 24 hours._"
             reporter.send_msg(final_msg)
             os.remove(file_path)
         except Exception as e:
