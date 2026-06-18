@@ -4,6 +4,7 @@ import aiohttp
 import requests
 import subprocess
 import time
+import glob
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
@@ -63,11 +64,47 @@ def update_progress_msg(chat_id, message_id, text):
 
 async def progress_callback(current, total, chat_id, message_id, last_update_time):
     now = time.time()
-    if now - last_update_time[0] > 5: # Update every 5 seconds to avoid flood
+    if now - last_update_time[0] > 5:
         percentage = (current / total) * 100
-        text = f"⏳ Downloading: {percentage:.1f}% ({current/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB)"
+        text = f"⏳ ဒေါင်းလုဒ်ဆွဲနေသည်: {percentage:.1f}% ({current/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB)"
         update_progress_msg(chat_id, message_id, text)
         last_update_time[0] = now
+
+async def process_telegram_link(client, bot, status_msg):
+    parts = MEDIA_LINK.split('/')
+    msg_id = int(parts[-1])
+    chat_id = parts[-2]
+    if chat_id.isdigit():
+        chat_id = int(f"-100{chat_id}")
+    
+    last_update = [time.time()]
+    msg = await client.get_messages(chat_id, ids=msg_id)
+    if not msg or not msg.media:
+        await bot.edit_message(status_msg, "❌ မီဒီယာဖိုင် ရှာမတွေ့ပါ။")
+        return None
+        
+    file_path = await client.download_media(
+        msg, 
+        progress_callback=lambda c, t: progress_callback(c, t, TARGET_CHAT_ID, status_msg.id, last_update)
+    )
+    return file_path
+
+async def process_universal_link(bot, status_msg):
+    await bot.edit_message(status_msg, "⏳ yt-dlp ဖြင့် ဒေါင်းလုဒ်ဆွဲနေသည်... ခဏစောင့်ပါ။")
+    try:
+        # Download using yt-dlp
+        subprocess.call([
+            'yt-dlp', '-o', '%(title)s.%(ext)s', '--max-filesize', '2G', MEDIA_LINK
+        ])
+        # Find the downloaded file (newest file in current dir excluding script)
+        files = glob.glob("*")
+        files = [f for f in files if f not in ["processor.py", "thumb.jpg"] and os.path.isfile(f)]
+        if not files:
+            return None
+        return max(files, key=os.path.getctime)
+    except Exception as e:
+        print(f"yt-dlp error: {e}")
+        return None
 
 async def main():
     client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
@@ -75,34 +112,26 @@ async def main():
     await client.connect()
     
     try:
-        parts = MEDIA_LINK.split('/')
-        msg_id = int(parts[-1])
-        chat_id = parts[-2]
-        if chat_id.isdigit():
-            chat_id = int(f"-100{chat_id}")
-            
-        status_msg = await bot.send_message(TARGET_CHAT_ID, "⏳ Starting download...")
-        last_update = [time.time()]
+        status_msg = await bot.send_message(TARGET_CHAT_ID, "⏳ လုပ်ဆောင်ချက် စတင်နေပြီ...")
         
-        msg = await client.get_messages(chat_id, ids=msg_id)
-        if not msg or not msg.media:
-            await bot.edit_message(status_msg, "❌ Media not found.")
+        file_path = None
+        if "t.me/" in MEDIA_LINK:
+            file_path = await process_telegram_link(client, bot, status_msg)
+        else:
+            file_path = await process_universal_link(bot, status_msg)
+            
+        if not file_path:
+            await bot.edit_message(status_msg, "❌ ဖိုင်ဒေါင်းလုဒ်ဆွဲခြင်း မအောင်မြင်ပါ။")
             return
-            
-        file_path = await client.download_media(
-            msg, 
-            progress_callback=lambda c, t: progress_callback(c, t, TARGET_CHAT_ID, status_msg.id, last_update)
-        )
+
         file_name = os.path.basename(file_path)
+        await bot.edit_message(status_msg, "✅ ဒေါင်းလုဒ်ပြီးပါပြီ။ အချက်အလက်များ စစ်ဆေးနေသည်...")
         
-        await bot.edit_message(status_msg, "✅ Download complete. Processing metadata...")
-        
-        # Metadata & Thumbnail
         duration, size = get_video_metadata(file_path)
         thumb_path = "thumb.jpg"
         has_thumb = generate_thumbnail(file_path, thumb_path)
         
-        metadata_text = f"📄 *File:* `{file_name}`\n📦 *Size:* {size/(1024*1024):.1f} MB\n⏱️ *Duration:* {int(duration//60)}m {int(duration%60)}s"
+        metadata_text = f"📄 *ဖိုင်အမည်:* `{file_name}`\n📦 *အရွယ်အစား:* {size/(1024*1024):.1f} MB\n⏱️ *ကြာချိန်:* {int(duration//60)} မိနစ် {int(duration%60)} စက္ကန့်"
         
         # 1. Send to Telegram
         if has_thumb:
@@ -111,12 +140,11 @@ async def main():
             await bot.send_file(TARGET_CHAT_ID, file_path, caption=metadata_text, parse_mode='markdown')
             
         # 2. Upload to Supabase
-        await bot.edit_message(status_msg, "☁️ Uploading to Supabase for Direct Link...")
+        await bot.edit_message(status_msg, "☁️ Supabase သို့ တင်နေသည်...")
         public_url = await upload_to_supabase(file_path, file_name)
         
         if public_url:
             final_text = f"🔗 *Direct Download Link:*\n`{public_url}`\n\n{metadata_text}"
-            # Use requests for inline button
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
             payload = {
                 "chat_id": TARGET_CHAT_ID,
@@ -124,17 +152,17 @@ async def main():
                 "parse_mode": "Markdown",
                 "reply_markup": {
                     "inline_keyboard": [[
-                        {"text": "🗑️ Delete from Cloud", "callback_data": f"delete:{file_name}"}
+                        {"text": "🗑️ Cloud ပေါ်မှ ဖျက်ရန်", "callback_data": f"delete:{file_name}"}
                     ]]
                 }
             }
             requests.post(url, json=payload)
             await bot.delete_messages(TARGET_CHAT_ID, [status_msg.id])
         else:
-            await bot.edit_message(status_msg, f"✅ Done! (Direct link failed/limit reached)\n\n{metadata_text}")
+            await bot.edit_message(status_msg, f"✅ ပြီးပါပြီ။ (Direct link မရပါ)\n\n{metadata_text}")
             
     except Exception as e:
-        await bot.send_message(TARGET_CHAT_ID, f"❌ Error: {str(e)}")
+        await bot.send_message(TARGET_CHAT_ID, f"❌ အမှားအယွင်း: {str(e)}")
     finally:
         await client.disconnect()
         await bot.disconnect()
