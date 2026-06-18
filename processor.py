@@ -2,6 +2,8 @@ import os
 import asyncio
 import aiohttp
 import requests
+import subprocess
+import time
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
@@ -18,6 +20,28 @@ SUPABASE_URL = os.environ.get('SUPABASE_URL')
 SUPABASE_KEY = os.environ.get('SUPABASE_KEY')
 SUPABASE_BUCKET = os.environ.get('SUPABASE_BUCKET')
 
+def get_video_metadata(file_path):
+    try:
+        cmd = [
+            'ffprobe', '-v', 'error', '-show_entries', 'format=duration,size',
+            '-of', 'default=noprint_wrappers=1:nokey=1', file_path
+        ]
+        output = subprocess.check_output(cmd).decode().split('\n')
+        duration = float(output[0])
+        size = int(output[1])
+        return duration, size
+    except:
+        return 0, 0
+
+def generate_thumbnail(file_path, thumb_path):
+    try:
+        subprocess.call([
+            'ffmpeg', '-i', file_path, '-ss', '00:00:01', '-vframes', '1', thumb_path
+        ])
+        return True
+    except:
+        return False
+
 async def upload_to_supabase(file_path, file_name):
     url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{file_name}"
     headers = {
@@ -30,22 +54,20 @@ async def upload_to_supabase(file_path, file_name):
                 if resp.status in [200, 201]:
                     return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{file_name}"
                 else:
-                    text = await resp.text()
-                    raise Exception(f"Supabase Upload Failed: {text}")
+                    return None
 
-def send_telegram_with_delete_button(chat_id, text, file_name):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "Markdown",
-        "reply_markup": {
-            "inline_keyboard": [[
-                {"text": "🗑️ Delete from Cloud", "callback_data": f"delete:{file_name}"}
-            ]]
-        }
-    }
+def update_progress_msg(chat_id, message_id, text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
     requests.post(url, json=payload)
+
+async def progress_callback(current, total, chat_id, message_id, last_update_time):
+    now = time.time()
+    if now - last_update_time[0] > 5: # Update every 5 seconds to avoid flood
+        percentage = (current / total) * 100
+        text = f"⏳ Downloading: {percentage:.1f}% ({current/(1024*1024):.1f}MB / {total/(1024*1024):.1f}MB)"
+        update_progress_msg(chat_id, message_id, text)
+        last_update_time[0] = now
 
 async def main():
     client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
@@ -59,26 +81,57 @@ async def main():
         if chat_id.isdigit():
             chat_id = int(f"-100{chat_id}")
             
-        await bot.send_message(TARGET_CHAT_ID, "⏳ Downloading media...")
-        msg = await client.get_messages(chat_id, ids=msg_id)
+        status_msg = await bot.send_message(TARGET_CHAT_ID, "⏳ Starting download...")
+        last_update = [time.time()]
         
+        msg = await client.get_messages(chat_id, ids=msg_id)
         if not msg or not msg.media:
-            await bot.send_message(TARGET_CHAT_ID, "❌ Media not found or link invalid.")
+            await bot.edit_message(status_msg, "❌ Media not found.")
             return
             
-        file_path = await client.download_media(msg)
+        file_path = await client.download_media(
+            msg, 
+            progress_callback=lambda c, t: progress_callback(c, t, TARGET_CHAT_ID, status_msg.id, last_update)
+        )
         file_name = os.path.basename(file_path)
         
-        await bot.send_message(TARGET_CHAT_ID, "✅ Downloaded. Uploading to Supabase and Telegram...")
+        await bot.edit_message(status_msg, "✅ Download complete. Processing metadata...")
         
-        # 1. Upload to Telegram (as file)
-        await bot.send_file(TARGET_CHAT_ID, file_path, caption=f"File: {file_name}")
+        # Metadata & Thumbnail
+        duration, size = get_video_metadata(file_path)
+        thumb_path = "thumb.jpg"
+        has_thumb = generate_thumbnail(file_path, thumb_path)
         
-        # 2. Upload to Supabase for Direct Link
-        if SUPABASE_URL and SUPABASE_KEY:
-            public_url = await upload_to_supabase(file_path, file_name)
-            message_text = f"🔗 *Direct Download Link:*\n`{public_url}`\n\n_You can delete this file from cloud storage after downloading._"
-            send_telegram_with_delete_button(TARGET_CHAT_ID, message_text, file_name)
+        metadata_text = f"📄 *File:* `{file_name}`\n📦 *Size:* {size/(1024*1024):.1f} MB\n⏱️ *Duration:* {int(duration//60)}m {int(duration%60)}s"
+        
+        # 1. Send to Telegram
+        if has_thumb:
+            await bot.send_file(TARGET_CHAT_ID, file_path, caption=metadata_text, thumb=thumb_path, parse_mode='markdown')
+        else:
+            await bot.send_file(TARGET_CHAT_ID, file_path, caption=metadata_text, parse_mode='markdown')
+            
+        # 2. Upload to Supabase
+        await bot.edit_message(status_msg, "☁️ Uploading to Supabase for Direct Link...")
+        public_url = await upload_to_supabase(file_path, file_name)
+        
+        if public_url:
+            final_text = f"🔗 *Direct Download Link:*\n`{public_url}`\n\n{metadata_text}"
+            # Use requests for inline button
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+            payload = {
+                "chat_id": TARGET_CHAT_ID,
+                "text": final_text,
+                "parse_mode": "Markdown",
+                "reply_markup": {
+                    "inline_keyboard": [[
+                        {"text": "🗑️ Delete from Cloud", "callback_data": f"delete:{file_name}"}
+                    ]]
+                }
+            }
+            requests.post(url, json=payload)
+            await bot.delete_messages(TARGET_CHAT_ID, [status_msg.id])
+        else:
+            await bot.edit_message(status_msg, f"✅ Done! (Direct link failed/limit reached)\n\n{metadata_text}")
             
     except Exception as e:
         await bot.send_message(TARGET_CHAT_ID, f"❌ Error: {str(e)}")
