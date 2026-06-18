@@ -17,7 +17,9 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 B2_KEY_ID = os.environ.get("B2_KEY_ID", "")
 B2_APPLICATION_KEY = os.environ.get("B2_APPLICATION_KEY", "")
 B2_BUCKET_NAME = os.environ.get("B2_BUCKET_NAME", "")
-CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "")
+# Cloudflare KV — use Global API Key (X-Auth-Email + X-Auth-Key) format
+CF_AUTH_EMAIL = os.environ.get("CF_AUTH_EMAIL", "")
+CF_AUTH_KEY   = os.environ.get("CF_AUTH_KEY", "")
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "")
 CF_KV_NAMESPACE_ID = os.environ.get("CF_KV_NAMESPACE_ID", "")
 
@@ -68,7 +70,11 @@ class B2NativeClient:
         resp = requests.post(f"{self.api_url}/b2api/v2/b2_list_buckets", headers=headers, json={"accountId": self.account_id})
         resp.raise_for_status()
         bucket_id = next((b['bucketId'] for b in resp.json()['buckets'] if b['bucketName'] == bucket_name), None)
-        resp = requests.post(f"{self.api_url}/b2api/v2/b2_get_download_authorization", headers=headers, json={"bucketId": bucket_id, "fileNamePrefix": file_name, "validDurationInSeconds": 86400})
+        resp = requests.post(
+            f"{self.api_url}/b2api/v2/b2_get_download_authorization",
+            headers=headers,
+            json={"bucketId": bucket_id, "fileNamePrefix": file_name, "validDurationInSeconds": 86400}
+        )
         resp.raise_for_status()
         token = resp.json()['authorizationToken']
         return f"{self.download_url}/file/{bucket_name}/{file_name}?Authorization={token}"
@@ -90,29 +96,43 @@ class ProgressReporter:
         bar = self.get_bar(percent)
         speed = current / (now - self.start_time) if (now - self.start_time) > 0 else 0
         eta = time.strftime("%M:%S", time.gmtime((total - current) / speed)) if speed > 0 else "00:00"
-        text = f"⏳ *{action}...*\n📄 File: `{self.filename}`\n📊 Progress: `[{bar}] {percent:.1f}%`\n⏱️ ETA: `{eta}`"
+        text = (
+            f"⏳ *{action}...*\n"
+            f"📄 File: `{self.filename}`\n"
+            f"📊 Progress: `[{bar}] {percent:.1f}%`\n"
+            f"⏱️ ETA: `{eta}`"
+        )
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText",
             json={"chat_id": self.chat_id, "message_id": self.msg_id, "text": text, "parse_mode": "Markdown"}
         )
 
+def cf_kv_headers():
+    """Build Cloudflare auth headers using Global API Key format."""
+    return {
+        "X-Auth-Email": CF_AUTH_EMAIL,
+        "X-Auth-Key": CF_AUTH_KEY,
+        "Content-Type": "application/json"
+    }
+
 async def get_kv_tasks():
-    # FIX: use /values/ endpoint for reading, not /keys/
     kv_base = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/storage/kv/namespaces/{CF_KV_NAMESPACE_ID}"
-    headers = {"Authorization": f"Bearer {CF_API_TOKEN}"}
+    headers = cf_kv_headers()
 
     # Step 1: list keys with prefix "task:"
     list_resp = requests.get(f"{kv_base}/keys?prefix=task:", headers=headers)
+    if list_resp.status_code == 401:
+        raise Exception("Cloudflare KV auth failed (401). Check CF_AUTH_EMAIL and CF_AUTH_KEY in GitHub Secrets.")
     list_resp.raise_for_status()
     keys = list_resp.json().get("result", [])
 
     tasks = []
     for k in keys:
         key_name = k["name"]
-        # FIX: get value from /values/{key}, not /keys/{key}
+        # Get value from /values/{key}
         val_resp = requests.get(f"{kv_base}/values/{key_name}", headers=headers)
         if val_resp.status_code != 200:
-            print(f"[WARN] Could not read KV key '{key_name}': {val_resp.status_code}")
+            print(f"[WARN] Could not read KV key '{key_name}': {val_resp.status_code} {val_resp.text[:200]}")
             continue
         try:
             val = val_resp.json()
@@ -120,7 +140,7 @@ async def get_kv_tasks():
             print(f"[WARN] Failed to parse KV value for '{key_name}': {e}")
             continue
         tasks.append({"key": key_name, "data": val})
-        # FIX: delete from /values/{key}, not the list endpoint
+        # Delete the processed key
         del_resp = requests.delete(f"{kv_base}/values/{key_name}", headers=headers)
         if del_resp.status_code not in (200, 204):
             print(f"[WARN] Failed to delete KV key '{key_name}': {del_resp.status_code}")
@@ -156,7 +176,6 @@ async def process_task(client, b2, task):
 
         if os.path.exists(file_path):
             reporter.update(100, 100, action="Uploading to B2")
-            # FIX: upload_file now returns file_name and raises on error
             uploaded_name = b2.upload_file(file_path, B2_BUCKET_NAME)
             link = b2.get_download_link(B2_BUCKET_NAME, uploaded_name)
             requests.post(
@@ -181,10 +200,14 @@ async def process_task(client, b2, task):
         )
 
 async def main():
-    if not STRING_SESSION:
-        raise Exception("STRING_SESSION_1 is not set. Check GitHub Secrets.")
-    if not CF_API_TOKEN or not CF_ACCOUNT_ID or not CF_KV_NAMESPACE_ID:
-        raise Exception("Cloudflare KV credentials missing. Check CF_API_TOKEN, CF_ACCOUNT_ID, CF_KV_NAMESPACE_ID.")
+    missing = []
+    if not STRING_SESSION: missing.append("STRING_SESSION_1")
+    if not CF_AUTH_EMAIL:  missing.append("CF_AUTH_EMAIL")
+    if not CF_AUTH_KEY:    missing.append("CF_AUTH_KEY")
+    if not CF_ACCOUNT_ID:  missing.append("CF_ACCOUNT_ID")
+    if not CF_KV_NAMESPACE_ID: missing.append("CF_KV_NAMESPACE_ID")
+    if missing:
+        raise Exception(f"Missing GitHub Secrets: {', '.join(missing)}")
 
     client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
     await client.connect()
@@ -199,7 +222,7 @@ async def main():
             await asyncio.gather(*(process_task(client, b2, t) for t in tasks))
         else:
             empty_polls += 1
-            print(f"[INFO] No tasks found. Poll {empty_polls}/10. Sleeping 30s...")
+            print(f"[INFO] No tasks. Poll {empty_polls}/10. Sleeping 30s...")
             await asyncio.sleep(30)
     print("[INFO] No tasks after 10 polls. Exiting.")
     await client.disconnect()
