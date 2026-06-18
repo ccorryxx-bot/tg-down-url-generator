@@ -12,7 +12,7 @@ from telethon.sessions import StringSession
 # Environment Variables
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
-STRING_SESSION = os.environ.get("STRING_SESSION", "")
+STRING_SESSION = os.environ.get("STRING_SESSION_1", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 B2_KEY_ID = os.environ.get("B2_KEY_ID", "")
 B2_APPLICATION_KEY = os.environ.get("B2_APPLICATION_KEY", "")
