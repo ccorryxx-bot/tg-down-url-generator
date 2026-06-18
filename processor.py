@@ -48,18 +48,25 @@ def send_tg_msg(text):
 
 async def download_telegram_media(client, link, file_path):
     try:
-        # Parse link to get message ID and chat
-        # Format: https://t.me/c/123456789/123 or https://t.me/channel/123
-        parts = link.split('/')
-        msg_id = int(parts[-1])
-        chat_id = parts[-2]
-        if chat_id.isdigit(): chat_id = int(f"-100{chat_id}")
+        # Improved link parsing for various T.me formats
+        # Handles: https://t.me/c/123456789/123, https://t.me/channel_name/123
+        match = re.search(r't\.me/(?:c/)?([^/]+)/(\d+)', link)
+        if not match:
+            return False, "Invalid Telegram link format."
         
+        chat_identifier = match.group(1)
+        msg_id = int(match.group(2))
+        
+        if chat_identifier.isdigit():
+            chat_id = int(f"-100{chat_identifier}")
+        else:
+            chat_id = chat_identifier
+            
         entity = await client.get_entity(chat_id)
         message = await client.get_messages(entity, ids=msg_id)
         
         if not message or not message.media:
-            return False, "Message has no media."
+            return False, "Message has no media or could not be found."
         
         async def progress_callback(current, total):
             p = round((current / total) * 100, 1)
@@ -81,16 +88,20 @@ async def main():
             send_tg_msg("❌ Telegram link များကို download ဆွဲရန် STRING_SESSION လိုအပ်ပါသည်။")
             return
         
-        client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
-        await client.connect()
-        success, err = await download_telegram_media(client, MEDIA_LINK, file_path)
-        await client.disconnect()
-        
-        if not success:
-            send_tg_msg(f"❌ Telegram Download Error: {err}")
+        try:
+            client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
+            await client.connect()
+            success, err = await download_telegram_media(client, MEDIA_LINK, file_path)
+            await client.disconnect()
+            
+            if not success:
+                send_tg_msg(f"❌ Telegram Download Error: {err}")
+                return
+        except Exception as e:
+            send_tg_msg(f"❌ Telethon Connection Error: {str(e)}")
             return
     else:
-        # Download using yt-dlp
+        # Download using yt-dlp for non-telegram links
         format_str = f"bestvideo[height<={QUALITY}]+bestaudio/best[height<={QUALITY}]/best"
         cmd = ['yt-dlp', '-f', format_str, '--merge-output-format', 'mp4', '-o', file_path, MEDIA_LINK]
         
@@ -103,7 +114,7 @@ async def main():
         process.wait()
         
         if process.returncode != 0:
-            send_tg_msg(f"❌ yt-dlp Error: Download failed for {MEDIA_LINK}")
+            send_tg_msg(f"❌ yt-dlp Error: Download failed. Link မှားနေနိုင်သည် သို့မဟုတ် Support မလုပ်သော site ဖြစ်နိုင်ပါသည်။")
             return
 
     if os.path.exists(file_path):
@@ -133,7 +144,7 @@ async def main():
         else:
             send_tg_msg(f"❌ Supabase Upload Error: {resp.status_code} - {resp.text}")
     else:
-        send_tg_msg("❌ Error: Downloaded file not found.")
+        send_tg_msg("❌ Error: Downloaded file not found on server.")
 
 if __name__ == "__main__":
     asyncio.run(main())
