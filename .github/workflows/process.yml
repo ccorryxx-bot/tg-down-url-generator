@@ -11,20 +11,20 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: '3.9'
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Install dependencies
         run: |
-          pip install telethon hachoir aiohttp boto3
+          pip install telethon hachoir aiohttp requests
       - name: Run processor
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
           STRING_SESSION: ${{ secrets.STRING_SESSION }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-          PUBLIC_URL_PREFIX: ${{ secrets.PUBLIC_URL_PREFIX }}
-          TARGET_CHAT_ID: ${{ github.event.client_payload.chat_id }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SUPABASE_BUCKET: ${{ secrets.SUPABASE_BUCKET }}
+          TARGET_CHAT_ID: ${{ github.event.client_payload.target_chat_id }}
           MEDIA_LINK: ${{ github.event.client_payload.media_link }}
         run: python processor.py
