@@ -2,10 +2,8 @@ import os
 import asyncio
 import re
 import time
-import json
 import subprocess
 import requests
-import aiohttp
 import boto3
 from botocore.client import Config
 from telethon import TelegramClient
@@ -35,11 +33,6 @@ s3 = boto3.client(
     config=Config(signature_version='s3v4')
 )
 
-async def report_progress(percent, status):
-    # Progress report via temporary file in B2 or simple TG message
-    # For simplicity, we'll just send TG messages for major milestones
-    print(f"Progress: {percent}% - {status}")
-
 def send_tg_msg(text):
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={
         "chat_id": TARGET_CHAT_ID,
@@ -49,14 +42,24 @@ def send_tg_msg(text):
 
 async def download_telegram_media(client, link, file_path):
     try:
+        # Match t.me links
         match = re.search(r't\.me/(?:c/)?([^/]+)/(\d+)', link)
         if not match: return False, "Invalid Telegram link format."
+        
         chat_identifier = match.group(1)
         msg_id = int(match.group(2))
-        chat_id = int(f"-100{chat_identifier}") if chat_identifier.isdigit() else chat_identifier
+        
+        # Handle private vs public chat identifiers
+        if chat_identifier.isdigit():
+            chat_id = int(f"-100{chat_identifier}")
+        else:
+            chat_id = chat_identifier
+            
         entity = await client.get_entity(chat_id)
         message = await client.get_messages(entity, ids=msg_id)
-        if not message or not message.media: return False, "No media found."
+        
+        if not message or not message.media: 
+            return False, "No media found in the message."
         
         await client.download_media(message, file_path)
         return True, None
@@ -71,7 +74,7 @@ async def main():
 
     if is_tg_link:
         if not STRING_SESSION:
-            send_tg_msg("❌ STRING_SESSION missing.")
+            send_tg_msg("❌ STRING_SESSION missing. Cannot download from Telegram.")
             return
         client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
         await client.connect()
@@ -81,6 +84,7 @@ async def main():
             send_tg_msg(f"❌ TG Download Error: {err}")
             return
     else:
+        # For non-Telegram links (YouTube, etc.)
         format_str = f"bestvideo[height<={QUALITY}]+bestaudio/best[height<={QUALITY}]/best"
         cmd = ['yt-dlp', '-f', format_str, '--merge-output-format', 'mp4', '-o', file_path, MEDIA_LINK]
         process = subprocess.run(cmd)
@@ -103,9 +107,12 @@ async def main():
                 ExpiresIn=86400
             )
             
-            msg = f"✅ *Download Complete!*\n\n🔗 [Direct Download Link]({download_url})\n\n_Note: This link is valid for 24 hours._"
+            msg = f"✅ *Download Complete!*\n\n📄 File: `{file_name}`\n🔗 [Direct Download Link]({download_url})\n\n_Note: This link is valid for 24 hours._"
             send_tg_msg(msg)
-            os.remove(file_path)
+            
+            # Cleanup local file
+            if os.path.exists(file_path):
+                os.remove(file_path)
         except Exception as e:
             send_tg_msg(f"❌ B2 Upload Error: {str(e)}")
     else:
