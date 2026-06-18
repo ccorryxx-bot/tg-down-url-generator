@@ -1,43 +1,44 @@
 import os
 import asyncio
-import aiohttp
-import requests
-import subprocess
+import re
 import time
 import json
-import sys
-import re
-from telethon import TelegramClient, events
+import subprocess
+import requests
+import aiohttp
+import boto3
+from botocore.client import Config
+from telethon import TelegramClient
 from telethon.sessions import StringSession
 
-# Configs
-API_ID = int(os.environ.get('API_ID', 0))
-API_HASH = os.environ.get('API_HASH', '')
-STRING_SESSION = os.environ.get('STRING_SESSION', '')
-BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
-MEDIA_LINK = os.environ.get('MEDIA_LINK', '')
-TARGET_CHAT_ID = int(os.environ.get('TARGET_CHAT_ID', 0))
-QUALITY = os.environ.get('QUALITY', '720')
+# Environment Variables
+API_ID = int(os.environ.get("API_ID", 0))
+API_HASH = os.environ.get("API_HASH", "")
+STRING_SESSION = os.environ.get("STRING_SESSION", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+TARGET_CHAT_ID = int(os.environ.get("TARGET_CHAT_ID", 0))
+MEDIA_LINK = os.environ.get("MEDIA_LINK", "")
+QUALITY = os.environ.get("QUALITY", "720")
 
-# Supabase Configs
-SUPABASE_URL = os.environ.get('SUPABASE_URL', '')
-SUPABASE_KEY = os.environ.get('SUPABASE_KEY', '')
-SUPABASE_BUCKET = os.environ.get('SUPABASE_BUCKET', '')
+# Backblaze B2 Settings
+B2_KEY_ID = os.environ.get("B2_KEY_ID", "")
+B2_APPLICATION_KEY = os.environ.get("B2_APPLICATION_KEY", "")
+B2_BUCKET_NAME = os.environ.get("B2_BUCKET_NAME", "")
+B2_ENDPOINT = os.environ.get("B2_ENDPOINT", "s3.us-east-005.backblazeb2.com")
 
-async def report_progress(percent, status="Downloading"):
-    file_name = f"progress_{TARGET_CHAT_ID}.json"
-    url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{file_name}"
-    data = json.dumps({"percent": percent, "status": status, "time": time.time()})
-    headers = {
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json",
-        "x-upsert": "true"
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, data=data) as resp:
-                pass
-    except: pass
+# S3 Client for Backblaze B2
+s3 = boto3.client(
+    's3',
+    endpoint_url=f'https://{B2_ENDPOINT}',
+    aws_access_key_id=B2_KEY_ID,
+    aws_secret_access_key=B2_APPLICATION_KEY,
+    config=Config(signature_version='s3v4')
+)
+
+async def report_progress(percent, status):
+    # Progress report via temporary file in B2 or simple TG message
+    # For simplicity, we'll just send TG messages for major milestones
+    print(f"Progress: {percent}% - {status}")
 
 def send_tg_msg(text):
     requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={
@@ -48,103 +49,67 @@ def send_tg_msg(text):
 
 async def download_telegram_media(client, link, file_path):
     try:
-        # Improved link parsing for various T.me formats
-        # Handles: https://t.me/c/123456789/123, https://t.me/channel_name/123
         match = re.search(r't\.me/(?:c/)?([^/]+)/(\d+)', link)
-        if not match:
-            return False, "Invalid Telegram link format."
-        
+        if not match: return False, "Invalid Telegram link format."
         chat_identifier = match.group(1)
         msg_id = int(match.group(2))
-        
-        if chat_identifier.isdigit():
-            chat_id = int(f"-100{chat_identifier}")
-        else:
-            chat_id = chat_identifier
-            
+        chat_id = int(f"-100{chat_identifier}") if chat_identifier.isdigit() else chat_identifier
         entity = await client.get_entity(chat_id)
         message = await client.get_messages(entity, ids=msg_id)
+        if not message or not message.media: return False, "No media found."
         
-        if not message or not message.media:
-            return False, "Message has no media or could not be found."
-        
-        async def progress_callback(current, total):
-            p = round((current / total) * 100, 1)
-            await report_progress(p, "Downloading from Telegram")
-
-        await client.download_media(message, file_path, progress_callback=progress_callback)
+        await client.download_media(message, file_path)
         return True, None
     except Exception as e:
         return False, str(e)
 
 async def main():
-    await report_progress(0, "Starting")
-    file_path = f"video_{TARGET_CHAT_ID}.mp4"
-    
+    file_path = f"video_{int(time.time())}.mp4"
     is_tg_link = "t.me/" in MEDIA_LINK
     
+    send_tg_msg("⏳ *Downloading...* Please wait.")
+
     if is_tg_link:
         if not STRING_SESSION:
-            send_tg_msg("❌ Telegram link များကို download ဆွဲရန် STRING_SESSION လိုအပ်ပါသည်။")
+            send_tg_msg("❌ STRING_SESSION missing.")
             return
-        
-        try:
-            client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
-            await client.connect()
-            success, err = await download_telegram_media(client, MEDIA_LINK, file_path)
-            await client.disconnect()
-            
-            if not success:
-                send_tg_msg(f"❌ Telegram Download Error: {err}")
-                return
-        except Exception as e:
-            send_tg_msg(f"❌ Telethon Connection Error: {str(e)}")
+        client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
+        await client.connect()
+        success, err = await download_telegram_media(client, MEDIA_LINK, file_path)
+        await client.disconnect()
+        if not success:
+            send_tg_msg(f"❌ TG Download Error: {err}")
             return
     else:
-        # Download using yt-dlp for non-telegram links
         format_str = f"bestvideo[height<={QUALITY}]+bestaudio/best[height<={QUALITY}]/best"
         cmd = ['yt-dlp', '-f', format_str, '--merge-output-format', 'mp4', '-o', file_path, MEDIA_LINK]
-        
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
-        for line in process.stdout:
-            if '%' in line:
-                match = re.search(r'(\d+\.\d+)%', line)
-                if match:
-                    await report_progress(float(match.group(1)), "Downloading")
-        process.wait()
-        
+        process = subprocess.run(cmd)
         if process.returncode != 0:
-            send_tg_msg(f"❌ yt-dlp Error: Download failed. Link မှားနေနိုင်သည် သို့မဟုတ် Support မလုပ်သော site ဖြစ်နိုင်ပါသည်။")
+            send_tg_msg("❌ yt-dlp Download Failed.")
             return
 
     if os.path.exists(file_path):
-        await report_progress(100, "Uploading to Storage")
-        file_name = f"{int(time.time())}_{file_path}"
-        upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{file_name}"
+        send_tg_msg("🚀 *Uploading to Backblaze B2...*")
+        file_name = os.path.basename(file_path)
         
-        with open(file_path, 'rb') as f:
-            resp = requests.post(
-                upload_url,
-                headers={"Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "video/mp4"},
-                data=f
+        try:
+            # Upload to B2
+            s3.upload_file(file_path, B2_BUCKET_NAME, file_name)
+            
+            # Generate Presigned URL (Valid for 24 hours)
+            download_url = s3.generate_presigned_url(
+                'get_object',
+                Params={'Bucket': B2_BUCKET_NAME, 'Key': file_name},
+                ExpiresIn=86400
             )
-        
-        if resp.ok:
-            direct_link = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{file_name}"
-            msg = f"✅ *Download ပြီးပါပြီ!*\n\n🔗 [Direct Download Link]({direct_link})"
-            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={
-                "chat_id": TARGET_CHAT_ID,
-                "text": msg,
-                "parse_mode": "Markdown",
-                "reply_markup": {
-                    "inline_keyboard": [[{"text": "🗑️ Delete File", "callback_data": f"delete:{file_name}"}]]
-                }
-            })
-            await report_progress(100, "Completed")
-        else:
-            send_tg_msg(f"❌ Supabase Upload Error: {resp.status_code} - {resp.text}")
+            
+            msg = f"✅ *Download Complete!*\n\n🔗 [Direct Download Link]({download_url})\n\n_Note: This link is valid for 24 hours._"
+            send_tg_msg(msg)
+            os.remove(file_path)
+        except Exception as e:
+            send_tg_msg(f"❌ B2 Upload Error: {str(e)}")
     else:
-        send_tg_msg("❌ Error: Downloaded file not found on server.")
+        send_tg_msg("❌ Error: File not found after download.")
 
 if __name__ == "__main__":
     asyncio.run(main())
