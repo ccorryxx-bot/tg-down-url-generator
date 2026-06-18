@@ -29,4 +29,5 @@ jobs:
           SUPABASE_BUCKET: ${{ secrets.SUPABASE_BUCKET }}
           TARGET_CHAT_ID: ${{ github.event.client_payload.target_chat_id }}
           MEDIA_LINK: ${{ github.event.client_payload.media_link }}
+          QUALITY: ${{ github.event.client_payload.quality }}
         run: python processor.py
