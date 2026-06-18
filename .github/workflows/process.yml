@@ -1,7 +1,18 @@
 name: Process Universal Media
 on:
-  repository_dispatch:
-    types: [process_media]
+  workflow_dispatch:
+    inputs:
+      media_link:
+        description: 'Link to the media'
+        required: true
+      target_chat_id:
+        description: 'Telegram Chat ID'
+        required: true
+      quality:
+        description: 'Video quality (360, 480, 720)'
+        required: true
+        default: '720'
+
 jobs:
   process:
     runs-on: ubuntu-latest
@@ -27,7 +38,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           SUPABASE_BUCKET: ${{ secrets.SUPABASE_BUCKET }}
-          TARGET_CHAT_ID: ${{ github.event.client_payload.target_chat_id }}
-          MEDIA_LINK: ${{ github.event.client_payload.media_link }}
-          QUALITY: ${{ github.event.client_payload.quality }}
+          TARGET_CHAT_ID: ${{ github.event.inputs.target_chat_id }}
+          MEDIA_LINK: ${{ github.event.inputs.media_link }}
+          QUALITY: ${{ github.event.inputs.quality }}
         run: python processor.py
