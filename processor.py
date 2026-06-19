@@ -11,7 +11,6 @@ from botocore.config import Config
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 
-# Environment Variables
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 STRING_SESSION = os.environ.get("STRING_SESSION_1", "")
@@ -49,7 +48,7 @@ def send_telegram(method, payload, retries=3):
                 return r.json()
             print(f"[WARN] Telegram {method} attempt {attempt+1} → {r.status_code}: {r.text[:200]}")
         except Exception as e:
-            print(f"[WARN] Telegram {method} attempt {attempt+1} exception: {e}")
+            print(f"[WARN] Telegram {method} attempt {attempt+1}: {e}")
         time.sleep(2)
     return None
 
@@ -73,7 +72,7 @@ async def get_kv_tasks():
     for prefix in ["task:", "cmd:"]:
         list_resp = requests.get(f"{kv_base}/keys?prefix={prefix}", headers=headers, timeout=30)
         if list_resp.status_code == 401:
-            raise Exception("Cloudflare KV 401 Unauthorized — check CF_AUTH_EMAIL / CF_AUTH_KEY")
+            raise Exception("CF KV 401 — check CF_AUTH_EMAIL / CF_AUTH_KEY")
         list_resp.raise_for_status()
         for k in list_resp.json().get("result", []):
             key_name = k["name"]
@@ -93,11 +92,11 @@ async def get_kv_tasks():
     return all_tasks
 
 
-# ─── Storage Management ────────────────────────────────────────────────────────
+# ─── Storage Commands ──────────────────────────────────────────────────────────
 
 async def process_storage_command(cmd_data):
-    chat_id = cmd_data.get("chatId")
-    msg_id  = cmd_data.get("msgId")
+    chat_id  = cmd_data.get("chatId")
+    msg_id   = cmd_data.get("msgId")
     cmd_type = cmd_data.get("type")
     s3 = get_s3()
 
@@ -111,6 +110,7 @@ async def process_storage_command(cmd_data):
         else:
             send_telegram("sendMessage", payload)
 
+    # ── list_storage ──────────────────────────────────────────────────────────
     if cmd_type == "list_storage":
         print(f"[INFO] Listing e2 storage for chat_id={chat_id}")
         try:
@@ -127,7 +127,6 @@ async def process_storage_command(cmd_data):
             total_mb = total_bytes / 1024 / 1024
             total_gb = total_mb / 1024
 
-            # Store filelist in KV for delete operations
             filelist = [{"key": f["Key"], "size": f.get("Size", 0)} for f in files]
             cf_kv_put(f"filelist:{chat_id}", json.dumps(filelist))
 
@@ -135,29 +134,34 @@ async def process_storage_command(cmd_data):
                 f"📊 *IDrive e2 သိုလှောင်မှုအခြေအနေ*\n\n"
                 f"📁 ဖိုင်အရေအတွက်: `{len(files)}`\n"
                 f"💾 သုံးထားသောနေရာ: `{total_gb:.3f} GB ({total_mb:.1f} MB)`\n"
-                f"🌐 Endpoint: `us-west-2`\n"
                 f"─────────────────────\n\n"
             )
 
             file_lines = []
-            for i, f in enumerate(files[:20]):
+            for i, f in enumerate(files[:15]):
                 size_mb = f.get("Size", 0) / 1024 / 1024
                 key = f["Key"]
-                short_key = key[:32] + "…" if len(key) > 32 else key
+                short_key = key[:30] + "…" if len(key) > 30 else key
                 modified = f.get("LastModified")
                 age_h = (time.time() - modified.timestamp()) / 3600 if modified else 0
-                file_lines.append(f"`{i+1}.` 📄 `{short_key}`\n    💾 `{size_mb:.1f} MB`  ⏱ `{age_h:.1f}h ago`")
+                file_lines.append(f"`{i+1}.` 📄 `{short_key}`\n    💾 `{size_mb:.0f} MB`  ⏱ `{age_h:.1f}h ago`")
 
-            if len(files) > 20:
-                file_lines.append(f"\n_...နောက်ထပ် {len(files) - 20} ဖိုင် ရှိသေးသည်_")
+            if len(files) > 15:
+                file_lines.append(f"\n_...နောက်ထပ် {len(files) - 15} ဖိုင် ရှိသေးသည်_")
 
             text = header + "\n".join(file_lines)
 
+            # Per-file delete buttons (max 15)
             keyboard = []
-            for i, f in enumerate(files[:20]):
+            for i, f in enumerate(files[:15]):
                 size_mb = f.get("Size", 0) / 1024 / 1024
-                short = f["Key"][:24] + "…" if len(f["Key"]) > 24 else f["Key"]
+                short = f["Key"][:22] + "…" if len(f["Key"]) > 22 else f["Key"]
                 keyboard.append([{"text": f"🗑️ {short} ({size_mb:.0f}MB)", "callback_data": f"del|{i}|{chat_id}"}])
+
+            # Delete All + Refresh buttons at bottom
+            keyboard.append([
+                {"text": f"💣 ဖိုင်အားလုံး ဖျက်မည် ({len(files)} ဖိုင်)", "callback_data": f"delete_all_confirm|{chat_id}|{len(files)}"}
+            ])
             keyboard.append([{"text": "🔄 Refresh", "callback_data": "storage_refresh"}])
 
             reply(text, keyboard)
@@ -167,8 +171,9 @@ async def process_storage_command(cmd_data):
             print(f"[ERROR] list_storage: {e}")
             reply(f"❌ *ဖိုင်စာရင်း ရယူမရပါ:*\n`{str(e)}`")
 
+    # ── delete (single file) ──────────────────────────────────────────────────
     elif cmd_type == "delete":
-        file_key  = cmd_data.get("fileKey")
+        file_key = cmd_data.get("fileKey")
         print(f"[INFO] Deleting e2 object: {file_key}")
         try:
             s3.delete_object(Bucket=E2_BUCKET_NAME, Key=file_key)
@@ -176,13 +181,63 @@ async def process_storage_command(cmd_data):
             reply(
                 f"✅ *ဖျက်သိမ်းပြီးပါပြီ!*\n\n"
                 f"📄 `{short}`\n\n"
-                f"_IDrive e2 Bucket မှ ဖျက်သိမ်းလိုက်ပါသည်။_\n\n"
-                f"_ဖိုင်စာရင်း ကြည့်ရန် 📊 ခလုတ်ကို နှိပ်ပါ။_"
+                f"_📊 ခလုတ်နှိပ်ပြီး ဖိုင်စာရင်း ပြန်ကြည့်ပါ_"
             )
             print(f"[INFO] Deleted: {file_key}")
         except Exception as e:
             print(f"[ERROR] delete: {e}")
             reply(f"❌ *ဖျက်မရပါ:*\n`{str(e)}`")
+
+    # ── delete_all ────────────────────────────────────────────────────────────
+    elif cmd_type == "delete_all":
+        print(f"[INFO] Delete ALL objects in bucket for chat_id={chat_id}")
+        try:
+            # List all objects with pagination
+            paginator = s3.get_paginator("list_objects_v2")
+            all_keys = []
+            for page in paginator.paginate(Bucket=E2_BUCKET_NAME):
+                for obj in page.get("Contents", []):
+                    all_keys.append({"Key": obj["Key"]})
+
+            if not all_keys:
+                reply("✅ *Bucket ဗလာဖြစ်နေပြီ* — ဖျက်စရာ ဖိုင်မရှိပါ။")
+                return
+
+            total = len(all_keys)
+            # Update status
+            reply(f"💣 *ဖိုင် {total} ခု ဖျက်နေသည်...*\n\n_S3 batch delete — ခဏစောင့်ပါ..._")
+
+            # Batch delete (1000 files per request)
+            deleted = 0
+            errors = []
+            for i in range(0, len(all_keys), 1000):
+                batch = all_keys[i:i+1000]
+                resp = s3.delete_objects(
+                    Bucket=E2_BUCKET_NAME,
+                    Delete={"Objects": batch, "Quiet": True}
+                )
+                deleted += len(batch) - len(resp.get("Errors", []))
+                errors.extend(resp.get("Errors", []))
+
+            if errors:
+                err_names = ", ".join(e.get("Key","?")[:20] for e in errors[:3])
+                reply(
+                    f"⚠️ *Partial Delete*\n\n"
+                    f"✅ ဖျက်ပြီး: `{deleted}` ဖိုင်\n"
+                    f"❌ မဖျက်ရ: `{len(errors)}` ဖိုင်\n"
+                    f"Error: `{err_names}`"
+                )
+            else:
+                reply(
+                    f"💣 *ဖျက်သိမ်းပြီးပါပြီ!*\n\n"
+                    f"✅ ဖိုင် `{deleted}` ခု အားလုံး ဖျက်သိမ်းလိုက်ပါသည်\n\n"
+                    f"_Bucket ယခု ဗလာဖြစ်နေပါပြီ_"
+                )
+            print(f"[INFO] delete_all complete: {deleted} deleted, {len(errors)} errors")
+
+        except Exception as e:
+            print(f"[ERROR] delete_all: {e}")
+            reply(f"❌ *Delete All မရပါ:*\n`{str(e)}`")
 
 
 # ─── Progress Reporter ─────────────────────────────────────────────────────────
@@ -266,13 +321,10 @@ async def process_task(client, task):
 
         reporter.update(100, 100, action="Uploading to IDrive e2")
         s3 = get_s3()
-
-        # boto3 multipart upload handles large files automatically
         from boto3.s3.transfer import TransferConfig
         tc = TransferConfig(multipart_threshold=50*1024*1024, multipart_chunksize=50*1024*1024)
         s3.upload_file(file_path, E2_BUCKET_NAME, object_key, Config=tc)
 
-        # Generate presigned URL (24h)
         url = s3.generate_presigned_url(
             "get_object",
             Params={"Bucket": E2_BUCKET_NAME, "Key": object_key},
@@ -308,22 +360,22 @@ async def process_task(client, task):
 
 async def main():
     missing = []
-    if not STRING_SESSION:      missing.append("STRING_SESSION_1")
-    if not E2_ACCESS_KEY_ID:    missing.append("E2_ACCESS_KEY_ID")
-    if not E2_SECRET_ACCESS_KEY:missing.append("E2_SECRET_ACCESS_KEY")
-    if not E2_ENDPOINT:         missing.append("E2_ENDPOINT")
-    if not E2_BUCKET_NAME:      missing.append("E2_BUCKET_NAME")
-    if not CF_AUTH_EMAIL:       missing.append("CF_AUTH_EMAIL")
-    if not CF_AUTH_KEY:         missing.append("CF_AUTH_KEY")
-    if not CF_ACCOUNT_ID:       missing.append("CF_ACCOUNT_ID")
-    if not CF_KV_NAMESPACE_ID:  missing.append("CF_KV_NAMESPACE_ID")
+    if not STRING_SESSION:       missing.append("STRING_SESSION_1")
+    if not E2_ACCESS_KEY_ID:     missing.append("E2_ACCESS_KEY_ID")
+    if not E2_SECRET_ACCESS_KEY: missing.append("E2_SECRET_ACCESS_KEY")
+    if not E2_ENDPOINT:          missing.append("E2_ENDPOINT")
+    if not E2_BUCKET_NAME:       missing.append("E2_BUCKET_NAME")
+    if not CF_AUTH_EMAIL:        missing.append("CF_AUTH_EMAIL")
+    if not CF_AUTH_KEY:          missing.append("CF_AUTH_KEY")
+    if not CF_ACCOUNT_ID:        missing.append("CF_ACCOUNT_ID")
+    if not CF_KV_NAMESPACE_ID:   missing.append("CF_KV_NAMESPACE_ID")
     if missing:
         raise Exception(f"Missing GitHub Secrets: {', '.join(missing)}")
 
     client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
     await client.connect()
     empty_polls = 0
-    print("[INFO] Processor started (IDrive e2 backend). Polling KV...")
+    print("[INFO] Processor started (IDrive e2). Polling KV...")
     while empty_polls < 10:
         tasks = await get_kv_tasks()
         if tasks:
