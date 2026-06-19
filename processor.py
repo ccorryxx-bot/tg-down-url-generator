@@ -351,10 +351,37 @@ async def process_task(client, task):
         print(f"[INFO] Task complete for chat_id={chat_id}")
 
     except Exception as e:
-        print(f"[ERROR] process_task for chat_id={chat_id}: {e}")
+        import botocore.exceptions as _bce
+        err_str = str(e)
+        if isinstance(e, _bce.ClientError):
+            code = e.response.get("Error", {}).get("Code", "Unknown")
+            msg  = e.response.get("Error", {}).get("Message", err_str)
+            if code == "AccessDenied":
+                friendly = (
+                    f"❌ *Upload Failed — Access Denied (S3)*\n\n"
+                    f"🔑 IDrive e2 key မှာ PutObject permission မရှိဘူး\n"
+                    f"S3 Error: `{code}: {msg}`"
+                )
+            elif code in ("NoSuchBucket", "404"):
+                friendly = f"❌ *Upload Failed — Bucket မတွေ့ဘူး*\n\n`{code}: {E2_BUCKET_NAME}`"
+            elif code == "QuotaExceeded":
+                friendly = f"❌ *Upload Failed — Storage quota ပြည့်သွားပြီ*\n\nIDrive e2 account storage limit စစ်ပါ"
+            else:
+                friendly = f"❌ *Upload Failed (S3 {code})*\n\n`{msg}`"
+        elif "No space left" in err_str:
+            friendly = f"❌ *Upload Failed — GitHub runner disk full*\n\n`{err_str}`"
+        elif "timed out" in err_str.lower() or "timeout" in err_str.lower():
+            friendly = f"❌ *Upload Failed — Timeout*\n\nFile ကြီးလွန်းနေနိုင်တယ် သို့မဟုတ် network ပြဿနာ\n`{err_str[:150]}`"
+        elif "No downloadable file" in err_str or "Invalid Telegram" in err_str:
+            friendly = f"❌ *Download Failed — Telegram link ပြဿနာ*\n\n`{err_str}`"
+        elif "yt-dlp failed" in err_str:
+            friendly = f"❌ *Download Failed — yt-dlp မအောင်မြင်ဘူး*\n\nLink ကို support မလုပ်ဘူး သို့မဟုတ် private content\n`{err_str}`"
+        else:
+            friendly = f"❌ *Download Failed*\n\n`{err_str[:300]}`"
+        print(f"[ERROR] process_task for chat_id={chat_id}: {err_str}")
         send_telegram("sendMessage", {
             "chat_id": chat_id,
-            "text": f"❌ *Download Failed*\n\n`{str(e)}`",
+            "text": friendly,
             "parse_mode": "Markdown"
         })
     finally:
