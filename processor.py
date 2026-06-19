@@ -321,9 +321,16 @@ async def process_task(client, task):
 
         reporter.update(100, 100, action="Uploading to IDrive e2")
         s3 = get_s3()
-        from boto3.s3.transfer import TransferConfig
-        tc = TransferConfig(multipart_threshold=50*1024*1024, multipart_chunksize=50*1024*1024)
-        s3.upload_file(file_path, E2_BUCKET_NAME, object_key, Config=tc)
+        # IDrive e2: use put_object for files <4.9GB (avoids multipart permission issues)
+        # Only files >4.9GB fall back to multipart upload
+        file_size = os.path.getsize(file_path)
+        if file_size < 4_900 * 1024 * 1024:
+            with open(file_path, 'rb') as f:
+                s3.put_object(Bucket=E2_BUCKET_NAME, Key=object_key, Body=f)
+        else:
+            from boto3.s3.transfer import TransferConfig
+            tc = TransferConfig(multipart_threshold=5*1024*1024*1024, multipart_chunksize=100*1024*1024)
+            s3.upload_file(file_path, E2_BUCKET_NAME, object_key, Config=tc)
 
         url = s3.generate_presigned_url(
             "get_object",
