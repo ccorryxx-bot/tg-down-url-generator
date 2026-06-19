@@ -57,10 +57,11 @@ jobs:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
-          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
-          B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
-          B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
+          E2_ACCESS_KEY_ID: ${{ secrets.E2_ACCESS_KEY_ID }}
+          E2_SECRET_ACCESS_KEY: ${{ secrets.E2_SECRET_ACCESS_KEY }}
+          E2_ENDPOINT: ${{ secrets.E2_ENDPOINT }}
+          E2_BUCKET_NAME: ${{ secrets.E2_BUCKET_NAME }}
+          E2_REGION: ${{ secrets.E2_REGION }}
           TARGET_CHAT_ID: ${{ github.event.inputs.target_chat_id }}
           MEDIA_LINK: ${{ github.event.inputs.media_link }}
           QUALITY: ${{ github.event.inputs.quality }}
